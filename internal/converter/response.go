@@ -110,7 +110,13 @@ func ConvertOpenAIStreamToClaudeStream(openaiChunk *models.OpenAIStreamResponse,
 
 	// Handle text content delta
 	if choice.Delta.Content != "" {
+		// Estimate output tokens from content
+		contentTokens := estimateContentTokens(choice.Delta.Content, isGeminiModel)
+		ctx.OutputTokens += contentTokens
+
+		// Add content to buffer
 		ctx.ContentBuffer += choice.Delta.Content
+
 		deltaEvent := models.ClaudeStreamEvent{
 			Type:  "content_block_delta",
 			Index: 0,
@@ -122,22 +128,41 @@ func ConvertOpenAIStreamToClaudeStream(openaiChunk *models.OpenAIStreamResponse,
 		events = append(events, deltaEvent)
 
 		logger.WithFields(logrus.Fields{
-			"event_type":   "content_block_delta",
-			"event_index":  0,
-			"delta_type":   "text_delta",
-			"delta_text":   choice.Delta.Content,
-			"delta_length": len(choice.Delta.Content),
-			"buffer_total": len(ctx.ContentBuffer),
-		}).Debug("📄 Added content_block_delta event")
+			"event_type":       "content_block_delta",
+			"event_index":      0,
+			"content_length":   len(choice.Delta.Content),
+			"content_tokens":   contentTokens,
+			"total_out_tokens": ctx.OutputTokens,
+			"content_chunk":    choice.Delta.Content,
+		}).Debug("📄 Added content_block_delta event with token calculation")
 	}
 
-	// Handle tool calls (if present) - Note: basic StreamDelta doesn't support tool calls
-	// This would need to be implemented if streaming tool calls are required
+	// Handle tool calls
 	if len(choice.Delta.ToolCalls) > 0 {
 		logger.WithFields(logrus.Fields{
 			"tool_calls_count": len(choice.Delta.ToolCalls),
 			"tool_calls":       choice.Delta.ToolCalls,
-		}).Info("🔧 Tool calls detected in stream - not yet implemented in converter")
+		}).Debug("🔧 Processing tool calls in stream conversion")
+
+		// Process tool calls and estimate tokens
+		for _, toolCall := range choice.Delta.ToolCalls {
+			toolCallTokens := estimateToolCallTokens(toolCall, isGeminiModel)
+			ctx.OutputTokens += toolCallTokens
+
+			// Create tool call events (simplified for streaming)
+			if toolCall.Function.Name != "" {
+				toolEvent := models.ClaudeStreamEvent{
+					Type:  "content_block_start",
+					Index: 1, // Tool calls typically start at index 1
+					ContentBlock: &models.ClaudeContentBlock{
+						Type: "tool_use",
+						ID:   toolCall.ID,
+						Name: toolCall.Function.Name,
+					},
+				}
+				events = append(events, toolEvent)
+			}
+		}
 	}
 
 	// Handle finish reason
@@ -187,7 +212,7 @@ func ConvertOpenAIStreamToClaudeStream(openaiChunk *models.OpenAIStreamResponse,
 			"stop_reason":   stopReason,
 			"input_tokens":  ctx.InputTokens,
 			"output_tokens": ctx.OutputTokens,
-		}).Debug("📦 Added message_delta event with stop reason")
+		}).Debug("📦 Added message_delta event with stop reason and usage")
 
 		// Send message stop
 		stopEvent := models.ClaudeStreamEvent{
@@ -210,6 +235,52 @@ func ConvertOpenAIStreamToClaudeStream(openaiChunk *models.OpenAIStreamResponse,
 	}).Debug("✅ Completed OpenAI to Claude stream conversion")
 
 	return events, nil
+}
+
+// estimateContentTokens estimates tokens from content text
+func estimateContentTokens(content string, isGeminiModel bool) int {
+	if content == "" {
+		return 0
+	}
+
+	// Different token estimation for different models
+	var charsPerToken int
+	if isGeminiModel {
+		charsPerToken = 3 // Gemini models tend to be more efficient
+	} else {
+		charsPerToken = 4 // Standard OpenAI models
+	}
+
+	// Basic word and character-based estimation
+	words := strings.Fields(content)
+	baseTokens := len(words) + len(content)/charsPerToken
+
+	return max(1, baseTokens)
+}
+
+// estimateToolCallTokens estimates tokens from tool call data
+func estimateToolCallTokens(toolCall models.OpenAIToolCallDelta, isGeminiModel bool) int {
+	totalTokens := 0
+
+	// Base overhead for tool call structure
+	totalTokens += 15
+
+	// Function name tokens
+	if toolCall.Function.Name != "" {
+		totalTokens += len(toolCall.Function.Name) / 4
+	}
+
+	// Function arguments tokens (JSON is more dense)
+	if toolCall.Function.Arguments != "" {
+		totalTokens += len(toolCall.Function.Arguments) / 3
+	}
+
+	// Gemini models might have slightly different overhead
+	if isGeminiModel {
+		totalTokens = int(float64(totalTokens) * 0.9) // 10% less overhead
+	}
+
+	return max(1, totalTokens)
 }
 
 // convertMessageToClaudeContent converts simple Message to Claude content blocks

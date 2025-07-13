@@ -201,6 +201,16 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 		"start_time": streamCtx.StartTime,
 	}).Debug("📡 Streaming context initialized")
 
+	// Calculate input tokens at the start
+	var totalInputTokens, totalOutputTokens int
+	totalInputTokens = h.modelRouter.EstimateTokenCount(claudeReq)
+
+	h.logger.WithFields(logrus.Fields{
+		"request_id":             requestID,
+		"estimated_input_tokens": totalInputTokens,
+		"is_gemini":              isGeminiModel,
+	}).Debug("📊 Calculated input tokens")
+
 	// Check for client disconnect before starting stream
 	if h.streamingService.CheckClientDisconnect(c) {
 		h.logger.WithField("request_id", requestID).Info("Client disconnected before stream start")
@@ -229,7 +239,7 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 		h.streamingService.HandleStreamingError(c, streamCtx, err)
 
 		// Log failed request
-		h.logStreamingRequest(requestID, claudeReq, openaiReq, nil, http.StatusInternalServerError, true, 0, 0, duration, err.Error(), startTime)
+		h.logStreamingRequest(requestID, claudeReq, openaiReq, nil, http.StatusInternalServerError, true, totalInputTokens, 0, duration, err.Error(), startTime)
 		return
 	}
 
@@ -243,7 +253,6 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 	defer pingCancel()
 	go h.streamingService.SendPeriodicPing(c, pingCtx)
 
-	var totalInputTokens, totalOutputTokens int
 	hasError := false
 	var streamError error
 	chunkCount := 0
@@ -255,67 +264,42 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 	}).Info("🎯 Starting stream chunk processing")
 
 	for chunk := range streamChan {
-		chunkCount++
-
-		// Enhanced chunk processing logging
-		h.logger.WithFields(logrus.Fields{
-			"request_id":   requestID,
-			"chunk_number": chunkCount,
-			"is_gemini":    isGeminiModel,
-			"chunk_done":   chunk.Done,
-			"has_error":    chunk.Error != nil,
-			"has_data":     chunk.Data != nil,
-		}).Debug("📦 Processing stream chunk")
-
-		// Check for client disconnect
-		if h.streamingService.CheckClientDisconnect(c) {
-			h.logger.WithFields(logrus.Fields{
-				"request_id":   requestID,
-				"chunk_number": chunkCount,
-				"is_gemini":    isGeminiModel,
-			}).Info("🔌 Client disconnected during streaming")
-			hasError = true
-			streamError = fmt.Errorf("client disconnected")
-			break
-		}
-
-		// Check for context cancellation
 		select {
 		case <-ctx.Done():
 			h.logger.WithFields(logrus.Fields{
-				"request_id":   requestID,
-				"chunk_number": chunkCount,
-				"is_gemini":    isGeminiModel,
-				"context_err":  ctx.Err(),
-			}).Warn("⏰ Request context cancelled")
+				"request_id":  requestID,
+				"is_gemini":   isGeminiModel,
+				"chunk_count": chunkCount,
+				"context_err": ctx.Err(),
+			}).Warn("⏰ Stream context cancelled")
 			hasError = true
 			streamError = ctx.Err()
-			break
+			goto exitLoop
 		default:
 		}
 
 		if chunk.Error != nil {
 			h.logger.WithFields(logrus.Fields{
-				"request_id":   requestID,
-				"chunk_number": chunkCount,
-				"is_gemini":    isGeminiModel,
-				"error":        chunk.Error.Error(),
+				"request_id":  requestID,
+				"is_gemini":   isGeminiModel,
+				"chunk_count": chunkCount,
+				"error":       chunk.Error.Error(),
 			}).Error("❌ Stream chunk error")
-			h.streamingService.HandleStreamingError(c, streamCtx, chunk.Error)
 			hasError = true
 			streamError = chunk.Error
-			break
+			goto exitLoop
 		}
 
 		if chunk.Done {
 			h.logger.WithFields(logrus.Fields{
-				"request_id":   requestID,
-				"chunk_number": chunkCount,
-				"is_gemini":    isGeminiModel,
-				"total_chunks": chunkCount,
-			}).Info("✅ Stream processing completed")
-			break
+				"request_id":  requestID,
+				"is_gemini":   isGeminiModel,
+				"chunk_count": chunkCount,
+			}).Info("✅ Stream completed normally")
+			goto exitLoop
 		}
+
+		chunkCount++
 
 		if chunk.Data != nil {
 			// Enhanced chunk data logging
@@ -361,6 +345,7 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 		}
 	}
 
+exitLoop:
 	// Enhanced completion logging
 	h.logger.WithFields(logrus.Fields{
 		"request_id":    requestID,
@@ -378,7 +363,7 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 		}(),
 	}).Info("🏁 Stream processing summary")
 
-	// Update usage tokens
+	// Update usage tokens with calculated values
 	h.streamingService.UpdateUsageTokens(streamCtx, totalInputTokens, totalOutputTokens)
 
 	// Determine stop reason
@@ -387,14 +372,22 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 		stopReason = "error"
 	}
 
-	// Finalize streaming with proper Claude Code events
-	h.streamingService.FinalizeStreaming(c, streamCtx, stopReason)
+	// Finalize streaming with usage information
+	h.streamingService.FinalizeStreamingWithUsage(c, streamCtx, stopReason, totalInputTokens, totalOutputTokens)
 
 	duration := time.Since(startTime)
+	h.logger.WithFields(logrus.Fields{
+		"request_id":    requestID,
+		"duration":      duration,
+		"input_tokens":  totalInputTokens,
+		"output_tokens": totalOutputTokens,
+		"is_gemini":     isGeminiModel,
+	}).Info("🎉 Claude Code streaming request completed")
 
 	// Log streaming request result
 	statusCode := http.StatusOK
 	errorMessage := ""
+
 	if hasError {
 		statusCode = http.StatusInternalServerError
 		if streamError != nil {
@@ -402,10 +395,16 @@ func (h *EnhancedMessagesHandler) handleClaudeCodeStreamingRequest(c *gin.Contex
 		}
 	}
 
-	h.logStreamingRequest(requestID, claudeReq, openaiReq, h.streamingService.GetStreamingStats(streamCtx), statusCode, true, totalInputTokens, totalOutputTokens, duration, errorMessage, startTime)
+	h.logStreamingRequest(requestID, claudeReq, openaiReq, gin.H{
+		"streaming": true,
+		"usage": gin.H{
+			"input_tokens":  totalInputTokens,
+			"output_tokens": totalOutputTokens,
+		},
+	}, statusCode, true, totalInputTokens, totalOutputTokens, duration, errorMessage, startTime)
 }
 
-// processStreamChunk processes individual stream chunks and converts them to Claude Code events
+// processStreamChunk processes a single stream chunk with enhanced token calculation
 func (h *EnhancedMessagesHandler) processStreamChunk(c *gin.Context, streamCtx *claudecode.StreamingContext, data interface{}, inputTokens, outputTokens *int) {
 	// Enhanced chunk processing logging
 	h.logger.WithFields(logrus.Fields{
@@ -442,19 +441,25 @@ func (h *EnhancedMessagesHandler) processStreamChunk(c *gin.Context, streamCtx *
 				"is_gemini":        strings.Contains(strings.ToLower(streamResp.Model), "gemini"),
 			}).Debug("📝 Processing choice delta")
 
-			// Handle delta content
+			// Calculate output tokens from content
 			if choice.Delta.Content != "" {
+				contentTokens := h.estimateTokensFromContent(choice.Delta.Content)
+				*outputTokens += contentTokens
+
 				h.logger.WithFields(logrus.Fields{
-					"request_id":     streamCtx.RequestID,
-					"content_length": len(choice.Delta.Content),
-					"content":        choice.Delta.Content,
-					"type":           "text_delta",
-					"is_gemini":      strings.Contains(strings.ToLower(streamResp.Model), "gemini"),
-				}).Debug("📄 Processing text chunk")
+					"request_id":          streamCtx.RequestID,
+					"content_length":      len(choice.Delta.Content),
+					"content":             choice.Delta.Content,
+					"estimated_tokens":    contentTokens,
+					"total_output_tokens": *outputTokens,
+					"type":                "text_delta",
+					"is_gemini":           strings.Contains(strings.ToLower(streamResp.Model), "gemini"),
+				}).Debug("📄 Processing text chunk with token calculation")
+
 				h.streamingService.ProcessTextChunk(c, streamCtx, choice.Delta.Content)
 			}
 
-			// Handle tool calls - with detailed logging
+			// Handle tool calls - with detailed logging and token calculation
 			if len(choice.Delta.ToolCalls) > 0 {
 				h.logger.WithFields(logrus.Fields{
 					"request_id":       streamCtx.RequestID,
@@ -462,6 +467,10 @@ func (h *EnhancedMessagesHandler) processStreamChunk(c *gin.Context, streamCtx *
 					"tool_calls":       choice.Delta.ToolCalls,
 					"is_gemini":        strings.Contains(strings.ToLower(streamResp.Model), "gemini"),
 				}).Info("🔧 Processing tool call deltas from OpenAI")
+
+				// Calculate tokens for tool calls
+				toolCallTokens := h.estimateTokensFromToolCalls(choice.Delta.ToolCalls)
+				*outputTokens += toolCallTokens
 
 				// Convert to interface{} slice for the streaming service
 				toolCallDeltas := make([]interface{}, len(choice.Delta.ToolCalls))
@@ -504,43 +513,12 @@ func (h *EnhancedMessagesHandler) processStreamChunk(c *gin.Context, streamCtx *
 	h.logger.WithFields(logrus.Fields{
 		"request_id": streamCtx.RequestID,
 		"data_type":  fmt.Sprintf("%T", data),
-		"data_value": data,
+		"data_value": fmt.Sprintf("%+v", data),
 		"is_gemini":  strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
-	}).Debug("🔄 Fallback: handling as map[string]interface{}")
+	}).Debug("⚠️ Unsupported data type in stream chunk")
 
-	// Fallback: handle as map[string]interface{} for compatibility
+	// Try to extract usage information from generic data
 	if dataMap, ok := data.(map[string]interface{}); ok {
-		// Handle choices
-		if choices, exists := dataMap["choices"]; exists {
-			if choicesArray, ok := choices.([]interface{}); ok && len(choicesArray) > 0 {
-				if choice, ok := choicesArray[0].(map[string]interface{}); ok {
-					// Handle delta content
-					if delta, exists := choice["delta"]; exists {
-						if deltaMap, ok := delta.(map[string]interface{}); ok {
-							// Handle text content
-							if content, exists := deltaMap["content"]; exists {
-								if contentStr, ok := content.(string); ok {
-									h.streamingService.ProcessTextChunk(c, streamCtx, contentStr)
-								}
-							}
-
-							// Handle tool calls
-							if toolCalls, exists := deltaMap["tool_calls"]; exists {
-								if toolCallsArray, ok := toolCalls.([]interface{}); ok {
-									h.logger.WithFields(logrus.Fields{
-										"tool_calls_count": len(toolCallsArray),
-										"tool_calls":       toolCallsArray,
-									}).Info("Processing tool call deltas from map interface")
-									h.streamingService.ProcessToolCallDeltas(c, streamCtx, toolCallsArray)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Handle usage information
 		if usage, exists := dataMap["usage"]; exists {
 			if usageMap, ok := usage.(map[string]interface{}); ok {
 				if prompt, exists := usageMap["prompt_tokens"]; exists {
@@ -556,6 +534,48 @@ func (h *EnhancedMessagesHandler) processStreamChunk(c *gin.Context, streamCtx *
 			}
 		}
 	}
+}
+
+// estimateTokensFromContent estimates tokens from text content
+func (h *EnhancedMessagesHandler) estimateTokensFromContent(content string) int {
+	if content == "" {
+		return 0
+	}
+
+	// Enhanced token estimation
+	// For most models: ~4 characters per token
+	// For Gemini: slightly different encoding, ~3.5 characters per token
+	baseTokens := len(content) / 4
+
+	// Adjust for word boundaries and special characters
+	words := strings.Fields(content)
+	if len(words) > 0 {
+		baseTokens = len(words) + len(content)/10 // Account for punctuation
+	}
+
+	return max(1, baseTokens)
+}
+
+// estimateTokensFromToolCalls estimates tokens from tool call deltas
+func (h *EnhancedMessagesHandler) estimateTokensFromToolCalls(toolCalls []models.OpenAIToolCallDelta) int {
+	totalTokens := 0
+
+	for _, tc := range toolCalls {
+		// Base overhead for tool call structure
+		totalTokens += 10
+
+		// Function name tokens
+		if tc.Function.Name != "" {
+			totalTokens += len(tc.Function.Name) / 4
+		}
+
+		// Function arguments tokens
+		if tc.Function.Arguments != "" {
+			totalTokens += len(tc.Function.Arguments) / 3 // JSON is more dense
+		}
+	}
+
+	return totalTokens
 }
 
 // handleNonStreamingRequest handles non-streaming requests (unchanged from original)

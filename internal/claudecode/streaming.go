@@ -386,8 +386,8 @@ func (s *StreamingService) ProcessToolCallDeltas(c *gin.Context, streamCtx *Stre
 	}
 }
 
-// FinalizeStreaming sends final Claude Code compatible events
-func (s *StreamingService) FinalizeStreaming(c *gin.Context, streamCtx *StreamingContext, stopReason string) {
+// FinalizeStreamingWithUsage finalizes streaming with accurate usage information
+func (s *StreamingService) FinalizeStreamingWithUsage(c *gin.Context, streamCtx *StreamingContext, stopReason string, inputTokens, outputTokens int) {
 	// Send content_block_stop event for text block
 	contentBlockStopEvent := map[string]interface{}{
 		"type":  "content_block_stop",
@@ -406,7 +406,7 @@ func (s *StreamingService) FinalizeStreaming(c *gin.Context, streamCtx *Streamin
 		}
 	}
 
-	// Send message_delta event with stop reason
+	// Send message_delta event with stop reason and accurate usage
 	messageDeltaEvent := map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
@@ -414,11 +414,21 @@ func (s *StreamingService) FinalizeStreaming(c *gin.Context, streamCtx *Streamin
 			"stop_sequence": nil,
 		},
 		"usage": map[string]interface{}{
-			"input_tokens":  0,
-			"output_tokens": 0,
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
 		},
 	}
 	s.writeSSEEvent(c, "message_delta", messageDeltaEvent)
+
+	// Enhanced logging for usage information
+	s.logger.WithFields(logrus.Fields{
+		"request_id":     streamCtx.RequestID,
+		"stop_reason":    stopReason,
+		"input_tokens":   inputTokens,
+		"output_tokens":  outputTokens,
+		"content_length": streamCtx.ContentBuffer.Len(),
+		"is_gemini":      strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+	}).Info("📊 Finalizing streaming with usage information")
 
 	// Send message_stop event
 	messageStopEvent := map[string]interface{}{
@@ -430,6 +440,12 @@ func (s *StreamingService) FinalizeStreaming(c *gin.Context, streamCtx *Streamin
 	if flusher, ok := c.Writer.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// FinalizeStreaming finalizes streaming with default behavior (kept for backward compatibility)
+func (s *StreamingService) FinalizeStreaming(c *gin.Context, streamCtx *StreamingContext, stopReason string) {
+	// Call the enhanced version with zero tokens (fallback)
+	s.FinalizeStreamingWithUsage(c, streamCtx, stopReason, 0, 0)
 }
 
 // HandleStreamingError handles streaming errors with Claude Code format
