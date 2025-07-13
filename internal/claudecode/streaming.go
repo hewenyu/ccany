@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -117,11 +118,36 @@ func (s *StreamingService) InitializeStreaming(c *gin.Context, requestID, model 
 // ProcessTextChunk processes a text chunk and sends Claude Code compatible delta
 func (s *StreamingService) ProcessTextChunk(c *gin.Context, streamCtx *StreamingContext, text string) {
 	if text == "" {
+		s.logger.WithFields(logrus.Fields{
+			"request_id": streamCtx.RequestID,
+			"model":      streamCtx.Model,
+			"is_gemini":  strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		}).Debug("📝 Skipping empty text chunk")
 		return
 	}
 
+	// Enhanced text processing logging
+	s.logger.WithFields(logrus.Fields{
+		"request_id":         streamCtx.RequestID,
+		"model":              streamCtx.Model,
+		"is_gemini":          strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		"text_length":        len(text),
+		"text_content":       text,
+		"buffer_size_before": streamCtx.ContentBuffer.Len(),
+		"text_block_index":   streamCtx.TextBlockIndex,
+	}).Debug("📄 Processing text chunk")
+
 	// Add to content buffer
 	streamCtx.ContentBuffer.WriteString(text)
+
+	// Enhanced buffer state logging
+	s.logger.WithFields(logrus.Fields{
+		"request_id":        streamCtx.RequestID,
+		"model":             streamCtx.Model,
+		"is_gemini":         strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		"buffer_size_after": streamCtx.ContentBuffer.Len(),
+		"total_content":     streamCtx.ContentBuffer.String(),
+	}).Debug("📊 Content buffer updated")
 
 	// Send content_block_delta event - matches claude-code-proxy format
 	deltaEvent := map[string]interface{}{
@@ -132,25 +158,97 @@ func (s *StreamingService) ProcessTextChunk(c *gin.Context, streamCtx *Streaming
 			"text": text,
 		},
 	}
+
+	// Enhanced SSE event logging
+	s.logger.WithFields(logrus.Fields{
+		"request_id":  streamCtx.RequestID,
+		"model":       streamCtx.Model,
+		"is_gemini":   strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		"event_type":  "content_block_delta",
+		"event_index": streamCtx.TextBlockIndex,
+		"delta_type":  "text_delta",
+		"delta_text":  text,
+	}).Debug("📡 Sending content_block_delta SSE event")
+
 	s.writeSSEEvent(c, "content_block_delta", deltaEvent)
 
 	// Flush immediately
 	if flusher, ok := c.Writer.(http.Flusher); ok {
 		flusher.Flush()
+		s.logger.WithFields(logrus.Fields{
+			"request_id": streamCtx.RequestID,
+			"model":      streamCtx.Model,
+			"is_gemini":  strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		}).Debug("🔄 Flushed SSE response")
+	} else {
+		s.logger.WithFields(logrus.Fields{
+			"request_id": streamCtx.RequestID,
+			"model":      streamCtx.Model,
+			"is_gemini":  strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		}).Warn("⚠️ Failed to flush SSE response - writer does not support flushing")
 	}
 }
 
 // ProcessToolCallDeltas processes tool call deltas from OpenAI streaming - based on claude-code-proxy
 func (s *StreamingService) ProcessToolCallDeltas(c *gin.Context, streamCtx *StreamingContext, toolCallDeltas []interface{}) {
-	for _, tcDelta := range toolCallDeltas {
+	// Enhanced tool call processing logging
+	s.logger.WithFields(logrus.Fields{
+		"request_id":               streamCtx.RequestID,
+		"model":                    streamCtx.Model,
+		"is_gemini":                strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+		"tool_calls_count":         len(toolCallDeltas),
+		"current_tool_calls_state": len(streamCtx.CurrentToolCalls),
+	}).Info("🔧 Starting tool call deltas processing")
+
+	for i, tcDelta := range toolCallDeltas {
+		s.logger.WithFields(logrus.Fields{
+			"request_id":  streamCtx.RequestID,
+			"model":       streamCtx.Model,
+			"is_gemini":   strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+			"delta_index": i,
+			"delta_type":  fmt.Sprintf("%T", tcDelta),
+			"delta_value": tcDelta,
+		}).Debug("🔨 Processing individual tool call delta")
+
 		if tcDeltaMap, ok := tcDelta.(map[string]interface{}); ok {
+			// Enhanced tool call delta parsing logging
+			s.logger.WithFields(logrus.Fields{
+				"request_id":  streamCtx.RequestID,
+				"model":       streamCtx.Model,
+				"is_gemini":   strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+				"delta_index": i,
+				"delta_map_keys": func() []string {
+					keys := make([]string, 0, len(tcDeltaMap))
+					for k := range tcDeltaMap {
+						keys = append(keys, k)
+					}
+					return keys
+				}(),
+			}).Debug("🗂️ Tool call delta map structure")
+
 			// Get index as integer, not string
 			indexFloat, ok := tcDeltaMap["index"].(float64)
 			if !ok {
+				s.logger.WithFields(logrus.Fields{
+					"request_id":  streamCtx.RequestID,
+					"model":       streamCtx.Model,
+					"is_gemini":   strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+					"delta_index": i,
+					"index_value": tcDeltaMap["index"],
+					"index_type":  fmt.Sprintf("%T", tcDeltaMap["index"]),
+				}).Warn("⚠️ Invalid tool call index type")
 				continue
 			}
 			tcIndex := int(indexFloat)
 			tcIndexStr := fmt.Sprintf("%d", tcIndex)
+
+			s.logger.WithFields(logrus.Fields{
+				"request_id":          streamCtx.RequestID,
+				"model":               streamCtx.Model,
+				"is_gemini":           strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+				"tool_call_index":     tcIndex,
+				"tool_call_index_str": tcIndexStr,
+			}).Debug("🔢 Tool call index parsed")
 
 			// Initialize tool call tracking by index if not exists
 			if _, exists := streamCtx.CurrentToolCalls[tcIndexStr]; !exists {
@@ -159,24 +257,75 @@ func (s *StreamingService) ProcessToolCallDeltas(c *gin.Context, streamCtx *Stre
 					JSONSent:   false,
 					Started:    false,
 				}
+				s.logger.WithFields(logrus.Fields{
+					"request_id":      streamCtx.RequestID,
+					"model":           streamCtx.Model,
+					"is_gemini":       strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+					"tool_call_index": tcIndex,
+				}).Debug("🆕 Initialized new tool call state")
 			}
 
 			toolCall := streamCtx.CurrentToolCalls[tcIndexStr]
 
+			// Enhanced tool call state logging
+			s.logger.WithFields(logrus.Fields{
+				"request_id":      streamCtx.RequestID,
+				"model":           streamCtx.Model,
+				"is_gemini":       strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+				"tool_call_index": tcIndex,
+				"tool_call_id":    toolCall.ID,
+				"tool_call_name":  toolCall.Name,
+				"args_buffer_len": len(toolCall.ArgsBuffer),
+				"json_sent":       toolCall.JSONSent,
+				"started":         toolCall.Started,
+			}).Debug("🔍 Current tool call state")
+
 			// Update tool call ID if provided
 			if id, exists := tcDeltaMap["id"]; exists {
 				if idStr, ok := id.(string); ok && idStr != "" {
+					oldID := toolCall.ID
 					toolCall.ID = idStr
+					s.logger.WithFields(logrus.Fields{
+						"request_id":      streamCtx.RequestID,
+						"model":           streamCtx.Model,
+						"is_gemini":       strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+						"tool_call_index": tcIndex,
+						"old_id":          oldID,
+						"new_id":          idStr,
+					}).Debug("🆔 Updated tool call ID")
 				}
 			}
 
 			// Update function name and start content block if we have both id and name
 			if function, exists := tcDeltaMap["function"]; exists {
 				if functionMap, ok := function.(map[string]interface{}); ok {
+					s.logger.WithFields(logrus.Fields{
+						"request_id":      streamCtx.RequestID,
+						"model":           streamCtx.Model,
+						"is_gemini":       strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+						"tool_call_index": tcIndex,
+						"function_keys": func() []string {
+							keys := make([]string, 0, len(functionMap))
+							for k := range functionMap {
+								keys = append(keys, k)
+							}
+							return keys
+						}(),
+					}).Debug("⚙️ Processing function map")
+
 					// Update function name
 					if name, exists := functionMap["name"]; exists {
 						if nameStr, ok := name.(string); ok && nameStr != "" {
+							oldName := toolCall.Name
 							toolCall.Name = nameStr
+							s.logger.WithFields(logrus.Fields{
+								"request_id":      streamCtx.RequestID,
+								"model":           streamCtx.Model,
+								"is_gemini":       strings.Contains(strings.ToLower(streamCtx.Model), "gemini"),
+								"tool_call_index": tcIndex,
+								"old_name":        oldName,
+								"new_name":        nameStr,
+							}).Debug("📝 Updated function name")
 						}
 					}
 

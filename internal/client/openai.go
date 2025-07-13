@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -157,11 +158,37 @@ func (c *OpenAIClient) CreateChatCompletionStream(ctx context.Context, req *mode
 		return nil, fmt.Errorf("logger is not configured")
 	}
 
+	// Enhanced logging for gemini model detection
+	isGeminiModel := strings.Contains(strings.ToLower(req.Model), "gemini")
+
 	c.logger.WithFields(logrus.Fields{
-		"model":      req.Model,
-		"stream":     true,
-		"max_tokens": req.MaxTokens,
-	}).Debug("Sending OpenAI streaming chat completion request")
+		"model":          req.Model,
+		"is_gemini":      isGeminiModel,
+		"stream":         true,
+		"max_tokens":     req.MaxTokens,
+		"temperature":    req.Temperature,
+		"top_p":          req.TopP,
+		"messages_count": len(req.Messages),
+		"base_url":       c.baseURL,
+		"final_endpoint": c.GetFinalEndpointURL(),
+	}).Info("🚀 Sending OpenAI streaming chat completion request")
+
+	// Log detailed request structure for gemini debugging
+	if c.logger.IsLevelEnabled(logrus.DebugLevel) {
+		reqJSON, _ := json.Marshal(req)
+		c.logger.WithFields(logrus.Fields{
+			"model":           req.Model,
+			"is_gemini":       isGeminiModel,
+			"request_payload": string(reqJSON),
+			"api_key_prefix": func() string {
+				if len(c.apiKey) > 8 {
+					return c.apiKey[:8] + "..."
+				} else {
+					return "short_key"
+				}
+			}(),
+		}).Debug("📋 Detailed OpenAI request payload")
+	}
 
 	// Convert our request to OpenAI SDK format
 	openaiReq := openai.ChatCompletionRequest{
@@ -173,28 +200,78 @@ func (c *OpenAIClient) CreateChatCompletionStream(ctx context.Context, req *mode
 	// Set optional fields with proper type conversion
 	if req.MaxTokens != nil {
 		openaiReq.MaxTokens = *req.MaxTokens
+		c.logger.WithFields(logrus.Fields{
+			"model":      req.Model,
+			"is_gemini":  isGeminiModel,
+			"max_tokens": *req.MaxTokens,
+		}).Debug("🔧 Set max tokens")
 	}
 	if req.Temperature != nil {
 		openaiReq.Temperature = float32(*req.Temperature)
+		c.logger.WithFields(logrus.Fields{
+			"model":       req.Model,
+			"is_gemini":   isGeminiModel,
+			"temperature": *req.Temperature,
+		}).Debug("🔧 Set temperature")
 	}
 	if req.TopP != nil {
 		openaiReq.TopP = float32(*req.TopP)
+		c.logger.WithFields(logrus.Fields{
+			"model":     req.Model,
+			"is_gemini": isGeminiModel,
+			"top_p":     *req.TopP,
+		}).Debug("🔧 Set top_p")
 	}
 	if req.N != nil {
 		openaiReq.N = *req.N
+		c.logger.WithFields(logrus.Fields{
+			"model":     req.Model,
+			"is_gemini": isGeminiModel,
+			"n":         *req.N,
+		}).Debug("🔧 Set n")
 	}
 	if req.Stop != nil {
 		if stopSlice, ok := req.Stop.([]string); ok {
 			openaiReq.Stop = stopSlice
+			c.logger.WithFields(logrus.Fields{
+				"model":     req.Model,
+				"is_gemini": isGeminiModel,
+				"stop":      stopSlice,
+			}).Debug("🔧 Set stop sequences")
 		}
+	}
+
+	// Enhanced logging for OpenAI SDK request
+	if c.logger.IsLevelEnabled(logrus.DebugLevel) {
+		openaiReqJSON, _ := json.Marshal(openaiReq)
+		c.logger.WithFields(logrus.Fields{
+			"model":              req.Model,
+			"is_gemini":          isGeminiModel,
+			"openai_sdk_request": string(openaiReqJSON),
+		}).Debug("📡 OpenAI SDK request structure")
 	}
 
 	// For streaming requests, use the provided context directly to avoid double timeout
 	// The handler already sets appropriate timeout based on request type
+	c.logger.WithFields(logrus.Fields{
+		"model":     req.Model,
+		"is_gemini": isGeminiModel,
+	}).Info("🔄 Creating OpenAI SDK stream connection")
+
 	stream, err := c.client.CreateChatCompletionStream(ctx, openaiReq)
 	if err != nil {
+		c.logger.WithFields(logrus.Fields{
+			"model":     req.Model,
+			"is_gemini": isGeminiModel,
+			"error":     err.Error(),
+		}).Error("❌ Failed to create OpenAI SDK stream connection")
 		return nil, fmt.Errorf("failed to create chat completion stream: %w", err)
 	}
+
+	c.logger.WithFields(logrus.Fields{
+		"model":     req.Model,
+		"is_gemini": isGeminiModel,
+	}).Info("✅ OpenAI SDK stream connection established")
 
 	streamChan := make(chan StreamChunk, 10)
 
@@ -202,9 +279,21 @@ func (c *OpenAIClient) CreateChatCompletionStream(ctx context.Context, req *mode
 		defer close(streamChan)
 		defer stream.Close()
 
+		chunkCount := 0
+		c.logger.WithFields(logrus.Fields{
+			"model":     req.Model,
+			"is_gemini": isGeminiModel,
+		}).Info("🎯 Starting OpenAI SDK stream processing")
+
 		for {
 			select {
 			case <-ctx.Done():
+				c.logger.WithFields(logrus.Fields{
+					"model":       req.Model,
+					"is_gemini":   isGeminiModel,
+					"chunk_count": chunkCount,
+					"context_err": ctx.Err(),
+				}).Warn("⏰ OpenAI SDK stream context cancelled")
 				streamChan <- StreamChunk{Error: ctx.Err(), Done: true}
 				return
 			default:
@@ -213,11 +302,45 @@ func (c *OpenAIClient) CreateChatCompletionStream(ctx context.Context, req *mode
 			response, err := stream.Recv()
 			if err != nil {
 				if err == io.EOF {
+					c.logger.WithFields(logrus.Fields{
+						"model":       req.Model,
+						"is_gemini":   isGeminiModel,
+						"chunk_count": chunkCount,
+					}).Info("✅ OpenAI SDK stream completed (EOF)")
 					streamChan <- StreamChunk{Done: true}
 					return
 				}
+				c.logger.WithFields(logrus.Fields{
+					"model":       req.Model,
+					"is_gemini":   isGeminiModel,
+					"chunk_count": chunkCount,
+					"error":       err.Error(),
+				}).Error("❌ OpenAI SDK stream receive error")
 				streamChan <- StreamChunk{Error: err, Done: true}
 				return
+			}
+
+			chunkCount++
+
+			// Enhanced response logging
+			c.logger.WithFields(logrus.Fields{
+				"model":          req.Model,
+				"is_gemini":      isGeminiModel,
+				"chunk_number":   chunkCount,
+				"response_id":    response.ID,
+				"response_model": response.Model,
+				"choices_count":  len(response.Choices),
+			}).Debug("📦 OpenAI SDK response chunk received")
+
+			// Log detailed response structure for gemini debugging
+			if c.logger.IsLevelEnabled(logrus.DebugLevel) {
+				responseJSON, _ := json.Marshal(response)
+				c.logger.WithFields(logrus.Fields{
+					"model":            req.Model,
+					"is_gemini":        isGeminiModel,
+					"chunk_number":     chunkCount,
+					"response_payload": string(responseJSON),
+				}).Debug("📊 OpenAI SDK response details")
 			}
 
 			// Convert SDK stream response to our format
@@ -227,6 +350,47 @@ func (c *OpenAIClient) CreateChatCompletionStream(ctx context.Context, req *mode
 				Created: response.Created,
 				Model:   response.Model,
 				Choices: convertStreamChoices(response.Choices),
+			}
+
+			// Enhanced conversion logging
+			c.logger.WithFields(logrus.Fields{
+				"model":           req.Model,
+				"is_gemini":       isGeminiModel,
+				"chunk_number":    chunkCount,
+				"original_model":  response.Model,
+				"converted_model": streamResp.Model,
+				"choices_count":   len(streamResp.Choices),
+			}).Debug("🔄 Converting OpenAI SDK response to internal format")
+
+			// Log choice details for gemini debugging
+			if len(streamResp.Choices) > 0 {
+				choice := streamResp.Choices[0]
+				c.logger.WithFields(logrus.Fields{
+					"model":            req.Model,
+					"is_gemini":        isGeminiModel,
+					"chunk_number":     chunkCount,
+					"choice_index":     choice.Index,
+					"delta_role":       choice.Delta.Role,
+					"delta_content":    choice.Delta.Content,
+					"finish_reason":    choice.FinishReason,
+					"tool_calls_count": len(choice.Delta.ToolCalls),
+				}).Debug("📝 Choice delta details")
+
+				// Log tool calls if present
+				if len(choice.Delta.ToolCalls) > 0 {
+					for i, tc := range choice.Delta.ToolCalls {
+						c.logger.WithFields(logrus.Fields{
+							"model":          req.Model,
+							"is_gemini":      isGeminiModel,
+							"chunk_number":   chunkCount,
+							"tool_call_idx":  i,
+							"tool_call_id":   tc.ID,
+							"tool_call_type": tc.Type,
+							"function_name":  tc.Function.Name,
+							"function_args":  tc.Function.Arguments,
+						}).Debug("🔧 Tool call delta details")
+					}
+				}
 			}
 
 			streamChan <- StreamChunk{Data: streamResp}

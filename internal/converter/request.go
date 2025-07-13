@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"ccany/internal/models"
+
+	"github.com/sirupsen/logrus"
 )
 
 // ConvertClaudeToOpenAI converts a Claude request to OpenAI format
@@ -76,13 +78,71 @@ func mapClaudeModelToOpenAI(claudeModel, bigModel, smallModel string) string {
 
 	claudeModelLower := strings.ToLower(claudeModel)
 
+	// Enhanced gemini model detection and mapping
+	if strings.Contains(claudeModelLower, "gemini") {
+		// Log gemini model detection
+		logrus.WithFields(logrus.Fields{
+			"claude_model":       claudeModel,
+			"claude_model_lower": claudeModelLower,
+			"detected_provider":  "gemini",
+			"big_model":          bigModel,
+			"small_model":        smallModel,
+		}).Info("🔍 Detected Gemini model in Claude request")
+
+		// Handle specific gemini versions
+		if strings.Contains(claudeModelLower, "gemini-2.0") || strings.Contains(claudeModelLower, "gemini-exp") {
+			logrus.WithFields(logrus.Fields{
+				"claude_model": claudeModel,
+				"mapped_to":    bigModel,
+				"reason":       "gemini-2.0 or experimental model",
+			}).Info("🎯 Mapping Gemini 2.0/experimental to big model")
+			return bigModel
+		}
+
+		if strings.Contains(claudeModelLower, "gemini-1.5-flash") || strings.Contains(claudeModelLower, "flash") {
+			logrus.WithFields(logrus.Fields{
+				"claude_model": claudeModel,
+				"mapped_to":    smallModel,
+				"reason":       "gemini flash model",
+			}).Info("🎯 Mapping Gemini Flash to small model")
+			return smallModel
+		}
+
+		if strings.Contains(claudeModelLower, "gemini-1.5-pro") || strings.Contains(claudeModelLower, "pro") {
+			logrus.WithFields(logrus.Fields{
+				"claude_model": claudeModel,
+				"mapped_to":    bigModel,
+				"reason":       "gemini pro model",
+			}).Info("🎯 Mapping Gemini Pro to big model")
+			return bigModel
+		}
+
+		// Default gemini mapping to big model
+		logrus.WithFields(logrus.Fields{
+			"claude_model": claudeModel,
+			"mapped_to":    bigModel,
+			"reason":       "default gemini mapping",
+		}).Info("🎯 Mapping unknown Gemini model to big model (default)")
+		return bigModel
+	}
+
 	// Check for haiku models (small/background)
 	if strings.Contains(claudeModelLower, "haiku") {
+		logrus.WithFields(logrus.Fields{
+			"claude_model": claudeModel,
+			"mapped_to":    smallModel,
+			"reason":       "haiku model",
+		}).Debug("🎯 Mapping Haiku to small model")
 		return smallModel
 	}
 
 	// Check for sonnet or opus models (big)
 	if strings.Contains(claudeModelLower, "sonnet") || strings.Contains(claudeModelLower, "opus") {
+		logrus.WithFields(logrus.Fields{
+			"claude_model": claudeModel,
+			"mapped_to":    bigModel,
+			"reason":       "sonnet or opus model",
+		}).Debug("🎯 Mapping Sonnet/Opus to big model")
 		return bigModel
 	}
 
@@ -92,16 +152,37 @@ func mapClaudeModelToOpenAI(claudeModel, bigModel, smallModel string) string {
 		parts := strings.Split(claudeModelLower, "/")
 		if len(parts) > 1 {
 			modelName := parts[1]
+			logrus.WithFields(logrus.Fields{
+				"claude_model": claudeModel,
+				"provider":     "anthropic",
+				"model_name":   modelName,
+			}).Debug("🏢 Processing Anthropic provider model")
+
 			if strings.Contains(modelName, "haiku") {
+				logrus.WithFields(logrus.Fields{
+					"claude_model": claudeModel,
+					"mapped_to":    smallModel,
+					"reason":       "anthropic haiku model",
+				}).Debug("🎯 Mapping Anthropic Haiku to small model")
 				return smallModel
 			}
 			if strings.Contains(modelName, "sonnet") || strings.Contains(modelName, "opus") {
+				logrus.WithFields(logrus.Fields{
+					"claude_model": claudeModel,
+					"mapped_to":    bigModel,
+					"reason":       "anthropic sonnet/opus model",
+				}).Debug("🎯 Mapping Anthropic Sonnet/Opus to big model")
 				return bigModel
 			}
 		}
 	}
 
 	// Default to big model for unknown Claude models
+	logrus.WithFields(logrus.Fields{
+		"claude_model": claudeModel,
+		"mapped_to":    bigModel,
+		"reason":       "unknown model default",
+	}).Debug("🎯 Mapping unknown model to big model (default)")
 	return bigModel
 }
 

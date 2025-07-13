@@ -77,13 +77,32 @@ func main() {
 		// Don't exit on validation failure, allow users to configure via web interface
 	}
 
-	// Setup logger
+	// Setup logger with enhanced debugging support
 	logger := logrus.New()
-	level, err := logrus.ParseLevel(cfg.LogLevel)
-	if err != nil {
-		level = logrus.InfoLevel
+	var level logrus.Level
+
+	// Check for DEBUG environment variable
+	if os.Getenv("DEBUG") == "1" || os.Getenv("LOG_LEVEL") == "debug" {
+		level = logrus.DebugLevel
+		logger.SetLevel(level)
+		logger.Info("🐛 Debug logging enabled - detailed gemini stream processing logs will be shown")
+	} else {
+		logLevelStr := cfg.LogLevel
+		if logLevelStr == "" {
+			logLevelStr = os.Getenv("LOG_LEVEL")
+		}
+		if logLevelStr == "" {
+			logLevelStr = "info"
+		}
+
+		var err error
+		level, err = logrus.ParseLevel(logLevelStr)
+		if err != nil {
+			level = logrus.InfoLevel
+		}
+		logger.SetLevel(level)
 	}
-	logger.SetLevel(level)
+
 	logger.SetFormatter(&logrus.JSONFormatter{})
 
 	// Initialize Claude Code configuration
